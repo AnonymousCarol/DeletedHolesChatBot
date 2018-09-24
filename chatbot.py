@@ -21,6 +21,7 @@ SG_ID = int(os.environ['SG_ID'])
 TOKEN = os.environ['TOKEN']
 
 challenges = open('challenges').readlines()
+names = [i.strip().title() for i in open('names').readlines()]
 
 '''
 # Challenges created by
@@ -38,8 +39,11 @@ STR.welcome = '请 /verify 认证后获得邀请链接'
 STR.already_verified = '已认证，如需重新获取邀请链接 /quit 并重新认证'
 STR.too_many = '请明日再试'
 STR.succeeded = '''认证成功，欢迎加入。
-接下来向本 bot 发送的消息会被匿名转发到群里。
-注意：转发的文字消息默认带有类似 [a0b1] 的标签用来区分匿名用户。在消息最前面加入 /anon 可以对本条消息隐藏此标签。
+
+注意：接下来向本 bot 发送的消息会被匿名转发到群里。
+转发的文字消息默认带有类似 "[a0b1] Smith:" 的标签用来区分匿名用户。
+在消息最前面加入 /anon 可以对本条消息隐藏此标签。
+
 入群链接（1 分钟内有效）：'''
 STR.failed = '回答错误，请 /verify 重试'
 STR.quitted = '已退出，如需重新认证请 /verify'
@@ -48,7 +52,9 @@ db = redis.StrictRedis()
 today = lambda: datetime.datetime.now().strftime("%F")
 
 def generate_hash(user_id):
-    return hmac.new(TOKEN, str(user_id)).hexdigest()[:4]
+    tag = hmac.new(TOKEN, str(user_id)).hexdigest()[:4]
+    name = names[int(tag, 16)%len(names)]
+    return tag, name
 
 def generate_link(bot):
     link = bot.export_chat_invite_link(SG_ID)
@@ -116,7 +122,7 @@ def forward_message(bot, msg):
         if msg.text.startswith('/anon'):
             text = msg.text[5:].strip()
         else:
-            text = '<b>[%s]</b> '%generate_hash(msg.from_user.id) + msg.text_html
+            text = '<b>[%s] %s:</b> '%generate_hash(msg.from_user.id) + msg.text_html
         bot.send_message(SG_ID, text, parse_mode="HTML")
 
 def message(bot, update):
