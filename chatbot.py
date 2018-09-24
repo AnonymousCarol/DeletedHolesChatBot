@@ -7,6 +7,7 @@
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 import telegram, logging, time, random, redis, datetime, os, sys
 from threading import Timer
+import hmac
 reload(sys); sys.setdefaultencoding('utf8')
 
 # Enable logging
@@ -36,12 +37,18 @@ STR.challenge_template = '请输入该帖的作者ID（不区分大小写）：\
 STR.welcome = '请 /verify 认证后获得邀请链接'
 STR.already_verified = '已认证，如需重新获取邀请链接 /quit 并重新认证'
 STR.too_many = '请明日再试'
-STR.succeeded = '认证成功，欢迎加入。\n接下来向本 bot 发送的消息会被匿名转发到群里。使用 /quit 可以取消认证。\n入群链接（1 分钟内有效）：\n'
+STR.succeeded = '''认证成功，欢迎加入。
+接下来向本 bot 发送的消息会被匿名转发到群里。
+注意：转发的文字消息默认带有类似 [a0b1] 的标签用来区分匿名用户。在消息最前面加入 /anon 可以对本条消息隐藏此标签。
+入群链接（1 分钟内有效）：'''
 STR.failed = '回答错误，请 /verify 重试'
 STR.quitted = '已退出，如需重新认证请 /verify'
 
 db = redis.StrictRedis()
 today = lambda: datetime.datetime.now().strftime("%F")
+
+def generate_hash(user_id):
+    return hmac.new(TOKEN, str(user_id)).hexdigest()[:4]
 
 def generate_link(bot):
     link = bot.export_chat_invite_link(SG_ID)
@@ -106,7 +113,11 @@ def forward_message(bot, msg):
     elif msg.sticker:
         bot.send_sticker(SG_ID, msg.sticker.file_id)
     else:
-        bot.send_message(SG_ID, msg.text_html, parse_mode="HTML")
+        if msg.text.startswith('/anon'):
+            text = msg.text[5:].strip()
+        else:
+            text = '<b>[%s]</b> '%generate_hash(msg.from_user.id) + msg.text_html
+        bot.send_message(SG_ID, text, parse_mode="HTML")
 
 def message(bot, update):
     """Forward the user message, or process verification."""
@@ -115,7 +126,8 @@ def message(bot, update):
     if auth == 'OK':
         forward_message(bot, update.message)
     elif auth == 'ANSWER':
-        if update.message.text.strip().lower() == db.get("answer:%s"%user_id).lower():
+        answer = db.get("answer:%s"%user_id)
+        if answer and update.message.text.strip().lower() == answer.lower():
             db.set("auth:%s"%user_id, "OK")
             update.message.reply_text(STR.succeeded+get_invite_link(bot))
         else:
