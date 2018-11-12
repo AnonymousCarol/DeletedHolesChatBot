@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 revoke_timer = None
 SG_ID = int(os.environ['SG_ID'])
 TOKEN = os.environ['TOKEN']
+SECRET = os.environ['SECRET']
 
 challenges = open('challenges').readlines()
 names = [i.strip().title() for i in open('names').readlines()]
@@ -39,20 +40,19 @@ STR.welcome = '请 /verify 认证后获得邀请链接'
 STR.already_verified = '已认证，如需重新获取邀请链接 /quit 并重新认证'
 STR.too_many = '请明日再试'
 STR.succeeded = '''认证成功，欢迎加入。
-
-注意：接下来向本 bot 发送的消息会被匿名转发到群里。
-转发的文字消息默认带有类似 "[a0b1] Smith:" 的标签用来区分匿名用户。
-在消息最前面加入 /anon 可以对本条消息隐藏此标签。
+接下来向本 bot 发送的消息会被匿名转发到群里，使用前请阅读群内置顶消息。
 
 入群链接（1 分钟内有效）：'''
 STR.failed = '回答错误，请 /verify 重试'
 STR.quitted = '已退出，如需重新认证请 /verify'
+STR.forwarded = '消息已转发，如需删除请回复以下命令：\n/delete %s %s'
+STR.deleted = '消息已删除'
 
 db = redis.StrictRedis()
 today = lambda: datetime.datetime.now().strftime("%F")
 
 def generate_hash(user_id):
-    tag = hmac.new(TOKEN, str(user_id)).hexdigest()[:4]
+    tag = hmac.new(SECRET, str(user_id)).hexdigest()[:4]
     name = names[int(tag, 16)%len(names)]
     return tag, name
 
@@ -94,6 +94,14 @@ def quit(bot, update):
     db.set("auth:%s"%user_id, "QUIT")
     update.message.reply_text(STR.quitted)
 
+def delete(bot, update, args):
+    try:
+        msg_id, tag = args
+        if tag != hmac.new(SECRET, str(msg_id)).hexdigest(): raise
+        bot.delete_message(chat_id=SG_ID, message_id=int(msg_id))
+        update.message.reply_text(STR.deleted)
+    except: pass
+
 def verify(bot, update):
     user_id = update.message.from_user.id
     auth = db.get("auth:%s"%user_id)
@@ -109,36 +117,42 @@ def verify(bot, update):
 def forward_message(bot, msg):
     """Forward a message."""
     if msg.photo:
-        bot.send_photo(SG_ID, msg.photo[0].file_id, caption=msg.caption)
+        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=msg.caption)
     elif msg.video:
-        bot.send_video(SG_ID, msg.video.file_id, caption=msg.caption)
+        r = bot.send_video(SG_ID, msg.video.file_id, caption=msg.caption)
     elif msg.voice:
-        bot.send_voice(SG_ID, msg.voice.file_id, caption=msg.caption)
+        r = bot.send_voice(SG_ID, msg.voice.file_id, caption=msg.caption)
     elif msg.document:
-        bot.send_document(SG_ID, msg.document.file_id, caption=msg.caption)
+        r = bot.send_document(SG_ID, msg.document.file_id, caption=msg.caption)
     elif msg.sticker:
-        bot.send_sticker(SG_ID, msg.sticker.file_id)
+        r = bot.send_sticker(SG_ID, msg.sticker.file_id)
     else:
-        if msg.text.startswith('/anon'):
+        if msg.text.startswith(('/anon', '/anno')):
             text = msg.text[5:].strip()
+        elif msg.text.startswith('//'):
+            text = msg.text[2:].strip()
         else:
             text = '<b>[%s] %s:</b> '%generate_hash(msg.from_user.id) + msg.text_html
-        bot.send_message(SG_ID, text, parse_mode="HTML")
+        r = bot.send_message(SG_ID, text, parse_mode="HTML")
+    return r.message_id
 
 def message(bot, update):
     """Forward the user message, or process verification."""
-    user_id = update.message.from_user.id
+    msg = update.message
+    user_id = msg.from_user.id
     auth = db.get("auth:%s"%user_id)
     if auth == 'OK':
-        forward_message(bot, update.message)
+        msg_id = forward_message(bot, msg)
+        tag = hmac.new(SECRET, str(msg_id)).hexdigest()
+        msg.reply_text(STR.forwarded%(msg_id, tag), reply_to_message_id=msg.message_id)
     elif auth == 'ANSWER':
         answer = db.get("answer:%s"%user_id)
-        if answer and update.message.text.strip().lower() == answer.lower():
+        if answer and msg.text.strip().lower() == answer.lower():
             db.set("auth:%s"%user_id, "OK")
-            update.message.reply_text(STR.succeeded+get_invite_link(bot))
+            msg.reply_text(STR.succeeded+get_invite_link(bot))
         else:
             db.set("auth:%s"%user_id, "FAIL")
-            update.message.reply_text(STR.failed)
+            msg.reply_text(STR.failed)
     else:
         return start(bot, update)
 
@@ -154,11 +168,12 @@ def main():
     dp.add_handler(CommandHandler("ping", ping))
     dp.add_handler(CommandHandler("start", start, Filters.private))
     dp.add_handler(CommandHandler("verify", verify, Filters.private))
+    dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
     dp.add_handler(CommandHandler("quit", quit, Filters.private))
     dp.add_handler(MessageHandler(Filters.private, message))
 
     dp.add_error_handler(error)
-    
+
     generate_link(updater.bot)
 
     updater.start_polling()
