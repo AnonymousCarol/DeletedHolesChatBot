@@ -165,7 +165,7 @@ def forward_message(bot, msg):
         txt = txt[2:].strip()
         tag, name = '*', 'Anonymous'
     else:
-        txt = msg.text_html or msg.caption_html
+        txt = msg.text_html or msg.caption_html or ''
     txt = '<b>[%s] </b>'%name + txt
 
     if msg.photo:
@@ -231,7 +231,6 @@ dp.add_handler(CommandHandler("help", start, Filters.private))
 dp.add_handler(CommandHandler("start", start, Filters.private))
 dp.add_handler(CommandHandler("verify", verify, Filters.private))
 dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
-dp.add_handler(CommandHandler("admin", whoami, Filters.private))
 dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
 dp.add_handler(MessageHandler(Filters.private, message))
 
