@@ -1,88 +1,116 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 # LICENSE: GNU Affero General Public License, version 3
-# required packages: python-telegram-bot redis
+# required packages: python-telegram-bot
 
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
-import telegram, logging, time, random, redis, datetime, os, sys
-from threading import Thread
-import hmac
-reload(sys); sys.setdefaultencoding('utf8')
+import logging, time, random, datetime, os, sys, hmac, hashlib, threading
 
-# Enable logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
-
+logging.basicConfig(format='%(asctime)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+now = lambda: time.time()
+bstr = lambda s: str(s).encode('ascii')
+hmac_md5 = lambda key, msg: hmac.new(key, bstr(msg), digestmod=hashlib.md5).hexdigest()
 
 bot = None
 SG_ID = int(os.environ['SG_ID'])
 TOKEN = os.environ['TOKEN']
-SECRET = os.environ['SECRET']
-global_salt = ''
-t_refresh = t_revoke = -1
+SECRET = bstr(os.environ['SECRET'])
 
-challenges = open('challenges').readlines()
-names = [i.strip().title() for i in open('names').readlines()]
+class G:
+    salt = ''
+    refresh = revoke = -1
 
-'''
-# Challenges created by
-for page in range(1,1000):
-    html = fetch_url('https://bbs.pku.edu.cn/v2/thread.php?bid=22&mode=single&page=%d'%page)
-    postids = re.findall(r'postid=(\d+)"', html)
-    users = re.findall(r'name limit">(\w+)<', html)
-    assert len(postids) == len(users)
-    for t,u in zip(postids, users): print t,u
-'''
+names_in_use = {}
+allowed_status = ("creator", "administrator", "member", "restricted")
+
+challenges, names = ['foo bar'], ['Alice', 'Bob', 'Carol']
+if all([os.path.exists(i) for i in ('names', 'challenges')]):
+    challenges = open('challenges').readlines()
+    names = [i.strip().title() for i in open('names').readlines()]
 
 class STR: pass
-STR.challenge_template = '请输入该帖的作者ID（不区分大小写）：\nhttps://bbs.pku.edu.cn/v2/post-read-single.php?bid=22&postid=%s'
+STR.challenge_template = '请输入该帖的作者 ID (不区分大小写):\n' \
+    'https://bbs.pku.edu.cn/v2/post-read-single.php?bid=22&postid=%s'
 STR.welcome = '请 /verify 认证后获得邀请链接'
-STR.already_verified = '已认证，如需重新获取邀请链接 /quit 并重新认证'
-STR.too_many = '请24小时后再试'
-STR.succeeded = '''认证成功，欢迎加入。
-接下来向本 bot 发送的消息会被匿名转发到群里，使用前请阅读群内置顶消息。
-
-入群链接（1 分钟内有效）：'''
-STR.failed = '回答错误，请 /verify 重试'
-STR.quitted = '已退出，如需重新认证请 /verify'
+STR.verified = '你已经在群里，如需帮助请见群简介里的说明'
+STR.too_many = '请 24 小时后再试'
+STR.succeeded = '认证成功，欢迎加入\n' \
+    '接下来向本 bot 发送的消息会被匿名转发到群里，使用前请阅读群简介里的说明\n\n' \
+    '入群链接 (1 分钟内有效):\n%s'
+STR.failed = '回答错误，请重试'
 STR.forwarded = '消息已转发，如需删除请回复以下命令：\n/delete %s %s'
 STR.deleted = '已删除'
 STR.unsupported = '不支持的消息'
-STR.whoami = '你当前的标签是 [%s] %s (%s)'
-STR.newtag = '''设置成功，有效期一周。如需取消并恢复到自动生成请回复：\n/newtag delete
-过期或取消后，如需重新设置成这一标签请回复：\n/newtag %s
-注意：除取消外，本命令每天限用一次，重新设置成原来的标签也算一次。'''
-STR.tag_default = '自动生成'
-STR.tag_ttl = '将于 %d 秒后过期'
-STR.tag_reset = '<b>[*] Bot:</b> 匿名标签已经重置'
+STR.whoami = '你当前的标签是 [%s] %s'
+STR.tag_reset = '<b>[Bot] </b>匿名标签已重置'
 
-db = redis.StrictRedis()
-now = lambda: time.time()
+class DB:
+    def __init__(self):
+        self.dict = dict()
+        self.ttl = dict()
+    def incr(self, key):
+        r = int(self.get(key) or 0) + 1
+        self.dict[key] = r
+        return r
+    def delete(self, key):
+        if key in self.dict:
+            del self.dict[key]
+        if key in self.ttl:
+            del self.ttl[key]
+    def expire(self, key, ex):
+        self.ttl[key] = ex+now() if ex else None
+    def get(self, key):
+        if key not in self.dict:
+            return None
+        if key in self.ttl and self.ttl[key] < now():
+            self.delete(key)
+            return None
+        return self.dict[key]
+    def set(self, key, value, ex=None):
+        self.dict[key] = value
+        self.expire(key, ex)
 
-def refresh_salt():
-    global global_salt
-    global_salt = os.urandom(16)
+db = DB()
 
 def generate_hash(user_id):
-    salt = db.get("salt:%s"%user_id) or global_salt
-    key = hmac.new(SECRET, salt).digest()
-    tag = hmac.new(key, str(user_id)).hexdigest()[:4]
-    name = names[int(tag, 16)%len(names)]
-    return tag, name
+    tag = hmac_md5(G.salt, user_id)[:4]
+    name = names_in_use.get(tag)
+    if name is None:
+        for i in range(len(names)):
+            name = names[(i+int(tag, 16))%len(names)]
+            if name not in names_in_use.values():
+                names_in_use[tag] = name
+                break
+    return tag, name or 'Unnamed'
 
 def generate_link():
-    link = bot.export_chat_invite_link(SG_ID)
+    link = str(bot.export_chat_invite_link(SG_ID))
     db.set("invite", link, ex=60)
-    print link
+    print(link)
     return link
 
-def get_invite_link(bot):
-    global t_revoke
+def get_invite_link():
     link = db.get("invite") or generate_link()
-    t_revoke = now() + 100
+    G.revoke = now() + 100
     return link
+
+def fetch_member_status(user_id):
+    try:
+        member = bot.get_chat_member(SG_ID, user_id)
+        return member.status in allowed_status
+    except: pass
+    return False
+
+def user_in_group(user_id, use_cache=True):
+    k = "auth:%s"%user_id
+    if use_cache and db.get(k):
+        return db.get(k) > 0
+    r = +1 if fetch_member_status(user_id) else -1
+    db.set(k, r, ex=600)
+    return r > 0
 
 def get_challenge():
     question, answer = random.choice(challenges).split()
@@ -100,145 +128,118 @@ def ping(bot, update):
     update.message.reply_text('pong')
 
 def start(bot, update):
-    update.message.reply_text(STR.welcome)
-
-def quit(bot, update):
     user_id = update.message.from_user.id
-    db.set("auth:%s"%user_id, "QUIT")
-    update.message.reply_text(STR.quitted)
+    text = STR.verified if user_in_group(user_id) else STR.welcome
+    update.message.reply_text(text)
 
 def delete(bot, update, args):
     try:
-        msg_id, tag = args
-        if tag != hmac.new(SECRET, str(msg_id)).hexdigest(): raise
+        msg_id, key = args
+        if key != hmac_md5(SECRET, msg_id): raise
         bot.delete_message(chat_id=SG_ID, message_id=int(msg_id))
         update.message.reply_text(STR.deleted)
     except: pass
 
 def whoami(bot, update):
     user_id = update.message.from_user.id
-    ttl = db.ttl("salt:%s"%user_id)
-    remark = STR.tag_default if ttl == -2 else STR.tag_ttl%ttl
     tag, name = generate_hash(user_id)
-    return update.message.reply_text(STR.whoami%(tag, name, remark))
-
-def newtag(bot, update, args):
-    try:
-        user_id = update.message.from_user.id
-        if db.get("auth:%s"%user_id) != 'OK':
-            return start(bot, update)
-        salt = args[0] if args else str(random.randint(10000, 99999))
-        if salt.lower() == 'delete':
-            db.delete("salt:%s"%user_id)
-            return update.message.reply_text(STR.deleted)
-        if auth_rate_limit(user_id, 'salt', 1):
-            return update.message.reply_text(STR.too_many)
-        db.set("salt:%s"%user_id, salt, ex=7*86400)
-        update.message.reply_text(STR.newtag%salt)
-        return whoami(bot, update)
-    except: pass
+    return update.message.reply_text(STR.whoami%(tag, name))
 
 def verify(bot, update):
     user_id = update.message.from_user.id
-    auth = db.get("auth:%s"%user_id)
-    if auth == 'OK':
-        return update.message.reply_text(STR.already_verified)
+    if user_in_group(user_id, use_cache=False):
+        return update.message.reply_text(STR.verified)
     if auth_rate_limit(user_id, 'auth', 10):
         return update.message.reply_text(STR.too_many)
     question, answer = get_challenge()
     db.set("answer:%s"%user_id, answer, ex=3600)
-    db.set("auth:%s"%user_id, "ANSWER")
     update.message.reply_text(question)
 
 def forward_message(bot, msg):
-    """Forward a message."""
-    global t_refresh
-    if t_refresh is None:
+    if G.refresh is None:
         bot.send_message(SG_ID, STR.tag_reset, parse_mode="HTML")
-    if msg.photo:
-        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=msg.caption)
-    elif msg.video:
-        r = bot.send_video(SG_ID, msg.video.file_id, caption=msg.caption)
-    elif msg.voice:
-        r = bot.send_voice(SG_ID, msg.voice.file_id, caption=msg.caption)
-    elif msg.document:
-        r = bot.send_document(SG_ID, msg.document.file_id, caption=msg.caption)
+
+    tag, name = generate_hash(msg.from_user.id)
+    txt = msg.text or msg.caption or ''
+    if txt.startswith('//'):
+        txt = txt[2:].strip()
+        tag, name = '*', 'Anonymous'
     else:
-        if not msg.text:
-            return None
-        if msg.text.startswith(('/anon', '/anno')):
-            text = '<b>[*] Anonymous:</b> ' + msg.text[5:].strip()
-        elif msg.text.startswith('//'):
-            text = '<b>[*] Anonymous:</b> ' + msg.text[2:].strip()
-        else:
-            text = '<b>[%s] %s:</b> '%generate_hash(msg.from_user.id) + msg.text_html
-        r = bot.send_message(SG_ID, text, parse_mode="HTML")
-    t_refresh = now() + 10000
+        txt = msg.text_html or msg.caption_html
+    txt = '<b>[%s] </b>'%name + txt
+
+    if msg.photo:
+        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=txt, parse_mode="HTML")
+    elif msg.video:
+        r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode="HTML")
+    elif msg.document:
+        r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode="HTML")
+    elif msg.voice:
+        r = bot.send_voice(SG_ID, msg.voice.file_id)
+    elif txt:
+        r = bot.send_message(SG_ID, txt, parse_mode="HTML")
+    else:
+        return None
+
+    G.refresh = now() + 10000
     return r.message_id
 
 def message(bot, update):
-    """Forward the user message, or process verification."""
     msg = update.message
     user_id = msg.from_user.id
-    auth = db.get("auth:%s"%user_id)
-    if auth == 'OK':
+
+    if user_in_group(user_id):
         msg_id = forward_message(bot, msg)
         if msg_id is None:
             return msg.reply_text(STR.unsupported)
-        tag = hmac.new(SECRET, str(msg_id)).hexdigest()
-        msg.reply_text(STR.forwarded%(msg_id, tag), reply_to_message_id=msg.message_id)
-    elif auth == 'ANSWER':
-        answer = db.get("answer:%s"%user_id)
-        if answer and msg.text.strip().lower() == answer.lower():
-            db.set("auth:%s"%user_id, "OK")
-            msg.reply_text(STR.succeeded+get_invite_link(bot))
-        else:
-            db.set("auth:%s"%user_id, "FAIL")
-            msg.reply_text(STR.failed)
-    else:
+        text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
+        return msg.reply_text(text, reply_to_message_id=msg.message_id)
+
+    answer = db.get("answer:%s"%user_id)
+    if answer is None:
         return start(bot, update)
+    db.delete("answer:%s"%user_id)
+    if msg.text.strip().lower() == answer.lower():
+        db.set("auth:%s"%user_id, 1, ex=100)
+        msg.reply_text(STR.succeeded%get_invite_link())
+    else:
+        msg.reply_text(STR.failed)
 
 def error(bot, update, error):
-    """Log Errors caused by Updates."""
     logger.warning('Update "%s" caused error "%s"', update, error)
 
 def timer():
-    global t_refresh, t_revoke
     while 1:
         try:
             t = now()
-            if t_refresh and t > t_refresh:
-                refresh_salt()
-                t_refresh = None
-            if t_revoke and t > t_revoke:
+            if G.refresh and t > G.refresh:
+                G.salt = os.urandom(16)
+                G.refresh = None
+                names_in_use.clear()
+            if G.revoke and t > G.revoke:
                 generate_link()
-                t_revoke = None
+                G.revoke = None
         except: pass
         time.sleep(1)
 
-def main():
-    """Start the bot."""
-    global bot
-    updater = Updater(TOKEN)
-    bot = updater.bot
-    dp = updater.dispatcher
+updater = Updater(TOKEN)
+bot = updater.bot
+dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler("ping", ping))
-    dp.add_handler(CommandHandler("start", start, Filters.private))
-    dp.add_handler(CommandHandler("verify", verify, Filters.private))
-    dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
-    dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
-    dp.add_handler(CommandHandler("newtag", newtag, Filters.private, pass_args=True))
-    dp.add_handler(CommandHandler("quit", quit, Filters.private))
-    dp.add_handler(MessageHandler(Filters.private, message))
+dp.add_handler(CommandHandler("ping", ping))
+dp.add_handler(CommandHandler("help", start, Filters.private))
+dp.add_handler(CommandHandler("start", start, Filters.private))
+dp.add_handler(CommandHandler("verify", verify, Filters.private))
+dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
+dp.add_handler(CommandHandler("admin", whoami, Filters.private))
+dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
+dp.add_handler(MessageHandler(Filters.private, message))
 
-    dp.add_error_handler(error)
+dp.add_error_handler(error)
 
-    t = Thread(target=timer)
-    t.daemon = True
-    t.start()
+t = threading.Thread(target=timer)
+t.daemon = True
+t.start()
 
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == '__main__': main()
+updater.start_polling()
+updater.idle()
