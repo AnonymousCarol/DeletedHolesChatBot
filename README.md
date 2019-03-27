@@ -8,7 +8,5 @@ telegram bot for group chat admission and anonymous chatting
 
 ## requirement
 
-* python2.7
+* python3
 * [python-telegram-bot](https://python-telegram-bot.org/)
-* [redis-py](https://github.com/andymccurdy/redis-py)
-* redis server
