@@ -21,9 +21,11 @@ SECRET = bstr(os.environ['SECRET'])
 
 class G:
     salt = ''
-    refresh = revoke = -1
+    refresh = revoke = 1
 
 names_in_use = {}
+banned_names = {}
+admin_status = ("creator", "administrator")
 allowed_status = ("creator", "administrator", "member", "restricted")
 
 challenges, names = ['foo bar'], ['Alice', 'Bob', 'Carol']
@@ -44,8 +46,9 @@ STR.failed = '回答错误，请重试'
 STR.forwarded = '消息已转发，如需删除请回复以下命令：\n/delete %s %s'
 STR.deleted = '已删除'
 STR.unsupported = '不支持的消息'
-STR.whoami = '你当前的标签是 [%s] %s'
-STR.tag_reset = '<b>[Bot] </b>匿名标签已重置'
+STR.banned = '%s 已被暂时禁言'
+STR.whoami = '你当前的标签是 [%s]'
+STR.tag_reset = '匿名标签已重置'
 
 class DB:
     def __init__(self):
@@ -55,18 +58,16 @@ class DB:
         r = int(self.get(key) or 0) + 1
         self.dict[key] = r
         return r
-    def delete(self, key):
-        if key in self.dict:
-            del self.dict[key]
-        if key in self.ttl:
-            del self.ttl[key]
+    def pop(self, key):
+        self.ttl.pop(key, None)
+        return self.dict.pop(key, None)
     def expire(self, key, ex):
         self.ttl[key] = ex+now() if ex else None
     def get(self, key):
         if key not in self.dict:
             return None
         if key in self.ttl and self.ttl[key] < now():
-            self.delete(key)
+            self.pop(key)
             return None
         return self.dict[key]
     def set(self, key, value, ex=None):
@@ -84,7 +85,7 @@ def generate_hash(user_id):
             if name not in names_in_use.values():
                 names_in_use[tag] = name
                 break
-    return tag, name or 'Unnamed'
+    return name or 'Unnamed'
 
 def generate_link():
     link = str(bot.export_chat_invite_link(SG_ID))
@@ -97,18 +98,17 @@ def get_invite_link():
     G.revoke = now() + 100
     return link
 
-def fetch_member_status(user_id):
+def get_member_status(user_id):
     try:
         member = bot.get_chat_member(SG_ID, user_id)
-        return member.status in allowed_status
-    except: pass
-    return False
+        return member.status
+    except: return None
 
 def user_in_group(user_id, use_cache=True):
     k = "auth:%s"%user_id
     if use_cache and db.get(k):
         return db.get(k) > 0
-    r = +1 if fetch_member_status(user_id) else -1
+    r = +1 if get_member_status(user_id) in allowed_status else -1
     db.set(k, r, ex=600)
     return r > 0
 
@@ -123,6 +123,10 @@ def auth_rate_limit(user_id, tag, n, exp=72000):
         return True
     db.expire(key, exp)
     return False
+
+def announce(msg):
+    r = bot.send_message(SG_ID, '<b>[Bot] </b>'+msg, parse_mode="HTML")
+    return r.message_id
 
 def ping(bot, update):
     update.message.reply_text('pong')
@@ -142,8 +146,10 @@ def delete(bot, update, args):
 
 def whoami(bot, update):
     user_id = update.message.from_user.id
-    tag, name = generate_hash(user_id)
-    return update.message.reply_text(STR.whoami%(tag, name))
+    if not user_in_group(user_id):
+        return start(bot, update)
+    name = generate_hash(user_id)
+    return update.message.reply_text(STR.whoami%name)
 
 def verify(bot, update):
     user_id = update.message.from_user.id
@@ -155,18 +161,36 @@ def verify(bot, update):
     db.set("answer:%s"%user_id, answer, ex=3600)
     update.message.reply_text(question)
 
+def ban(bot, update, args):
+    user_id = update.message.from_user.id
+    if get_member_status(user_id) not in admin_status: return
+    name = str(args[0]).title()
+    if name.startswith('-'): # unban
+        if banned_names.pop(name.strip('-'), None):
+            update.message.reply_text('OK')
+    elif name in names or name == 'Anonymous':
+        till = (now() + int(args[1])) if len(args)>1 else 0
+        banned_names[name] = till
+        announce(STR.banned%name)
+    else:
+        update.message.reply_text(str())
+
 def forward_message(bot, msg):
     if G.refresh is None:
-        bot.send_message(SG_ID, STR.tag_reset, parse_mode="HTML")
+        announce(STR.tag_reset)
+        G.refresh = 0 # suppress duplicate announcements
 
-    tag, name = generate_hash(msg.from_user.id)
-    txt = msg.text or msg.caption or ''
-    if txt.startswith('//'):
-        txt = txt[2:].strip()
-        tag, name = '*', 'Anonymous'
-    else:
-        txt = msg.text_html or msg.caption_html or ''
+    name = generate_hash(msg.from_user.id)
+    raw_txt = msg.text or msg.caption or ''
+    txt = msg.text_html or msg.caption_html or ''
+    if raw_txt.startswith('//'):
+        txt = raw_txt = raw_txt[2:].strip()
+        name = 'Anonymous'
+
     txt = '<b>[%s] </b>'%name + txt
+
+    if name in banned_names:
+        return msg.reply_text(STR.banned%name)
 
     if msg.photo:
         r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=txt, parse_mode="HTML")
@@ -174,31 +198,30 @@ def forward_message(bot, msg):
         r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode="HTML")
     elif msg.document:
         r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode="HTML")
-    elif msg.voice:
-        r = bot.send_voice(SG_ID, msg.voice.file_id)
-    elif txt:
+    elif raw_txt:
         r = bot.send_message(SG_ID, txt, parse_mode="HTML")
     else:
-        return None
+        return msg.reply_text(STR.unsupported)
 
     G.refresh = now() + 10000
-    return r.message_id
+    msg_id = r.message_id
+    text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
+    return msg.reply_text(text, reply_to_message_id=msg.message_id)
+
+def del_message(bot, update):
+    update.message.delete()
 
 def message(bot, update):
     msg = update.message
     user_id = msg.from_user.id
 
     if user_in_group(user_id):
-        msg_id = forward_message(bot, msg)
-        if msg_id is None:
-            return msg.reply_text(STR.unsupported)
-        text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
-        return msg.reply_text(text, reply_to_message_id=msg.message_id)
+        return forward_message(bot, msg)
 
-    answer = db.get("answer:%s"%user_id)
+    answer = db.pop("answer:%s"%user_id)
     if answer is None:
         return start(bot, update)
-    db.delete("answer:%s"%user_id)
+
     if msg.text.strip().lower() == answer.lower():
         db.set("auth:%s"%user_id, 1, ex=100)
         msg.reply_text(STR.succeeded%get_invite_link())
@@ -212,10 +235,12 @@ def timer():
     while 1:
         try:
             t = now()
-            if G.refresh and t > G.refresh:
+            refresh_time = max(0, G.refresh or 0, *banned_names.values())
+            if refresh_time and t > refresh_time:
                 G.salt = os.urandom(16)
-                G.refresh = None
                 names_in_use.clear()
+                banned_names.clear()
+                G.refresh = None
             if G.revoke and t > G.revoke:
                 generate_link()
                 G.revoke = None
@@ -227,12 +252,15 @@ bot = updater.bot
 dp = updater.dispatcher
 
 dp.add_handler(CommandHandler("ping", ping))
+dp.add_handler(CommandHandler("ban", ban, pass_args=True))
 dp.add_handler(CommandHandler("help", start, Filters.private))
 dp.add_handler(CommandHandler("start", start, Filters.private))
 dp.add_handler(CommandHandler("verify", verify, Filters.private))
 dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
 dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
 dp.add_handler(MessageHandler(Filters.private, message))
+dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, del_message))
+dp.add_handler(MessageHandler(Filters.status_update.left_chat_member, del_message))
 
 dp.add_error_handler(error)
 
