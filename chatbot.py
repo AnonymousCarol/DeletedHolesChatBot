@@ -14,9 +14,11 @@ now = lambda: time.time()
 bstr = lambda s: str(s).encode('ascii')
 hmac_md5 = lambda key, msg: hmac.new(key, bstr(msg), digestmod=hashlib.md5).hexdigest()
 
-bot = None
-SG_ID = int(os.environ['SG_ID'])
+bot = forwarder = None
+SG_ID = int(os.environ['SG_ID']) # supergroup ID
+CH_ID = int(os.environ['CH_ID']) # channel ID
 TOKEN = os.environ['TOKEN']
+FWD_TOKEN = os.environ['FWD_TOKEN']
 SECRET = bstr(os.environ['SECRET'])
 
 class G:
@@ -140,7 +142,13 @@ def delete(bot, update, args):
     try:
         msg_id, key = args
         if key != hmac_md5(SECRET, msg_id): raise
-        bot.delete_message(chat_id=SG_ID, message_id=int(msg_id))
+        chmsg_id = int(msg_id) >> 24
+        sgmsg_id = int(msg_id) & 0xffffff
+        if chmsg_id:
+            forwarder.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
+            bot.delete_message(chat_id=CH_ID, message_id=chmsg_id)
+        else:
+            bot.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
         update.message.reply_text(STR.deleted)
     except: pass
 
@@ -182,29 +190,37 @@ def forward_message(bot, msg):
 
     name = generate_hash(msg.from_user.id)
     raw_txt = msg.text or msg.caption or ''
-    txt = msg.text_html or msg.caption_html or ''
+    txt = msg.text_markdown or msg.caption_markdown or ''
+    mode = "Markdown"
     if raw_txt.startswith('//'):
-        txt = raw_txt = raw_txt[2:].strip()
+        raw_txt = raw_txt[2:].strip()
+        txt = txt.replace('/', '', 2)
         name = 'Anonymous'
 
-    txt = '<b>[%s] </b>'%name + txt
+    txt = '*[%s] *'%name + txt
+    chmsg_id = 0
 
     if name in banned_names:
         return msg.reply_text(STR.banned%name)
 
     if msg.photo:
-        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=txt, parse_mode="HTML")
+        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=txt, parse_mode=mode)
     elif msg.video:
-        r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode="HTML")
+        r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode=mode)
     elif msg.document:
-        r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode="HTML")
+        r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode=mode)
     elif raw_txt:
-        r = bot.send_message(SG_ID, txt, parse_mode="HTML")
+        if any([i.type in ('url', 'text_link') for i in msg.entities]):
+            chmsg = bot.send_message(CH_ID, txt, parse_mode=mode)
+            chmsg_id = chmsg.message_id
+            r = forwarder.forward_message(SG_ID, CH_ID, chmsg_id)
+        else:
+            r = bot.send_message(SG_ID, txt, parse_mode=mode)
     else:
         return msg.reply_text(STR.unsupported)
 
     G.refresh = now() + 10000
-    msg_id = r.message_id
+    msg_id = (chmsg_id << 24) + r.message_id
     text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
     return msg.reply_text(text, reply_to_message_id=msg.message_id)
 
@@ -247,6 +263,7 @@ def timer():
         except: pass
         time.sleep(1)
 
+forwarder = Updater(FWD_TOKEN).bot
 updater = Updater(TOKEN)
 bot = updater.bot
 dp = updater.dispatcher
