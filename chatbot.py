@@ -4,8 +4,9 @@
 # LICENSE: GNU Affero General Public License, version 3
 # required packages: python-telegram-bot
 
+from telegram.utils.request import Request
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
-import logging, time, random, datetime, os, sys, hmac, hashlib, threading
+import logging, time, random, datetime, os, sys, hmac, hashlib, threading, re
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -15,6 +16,8 @@ bstr = lambda s: str(s).encode('ascii')
 hmac_md5 = lambda key, msg: hmac.new(key, bstr(msg), digestmod=hashlib.md5).hexdigest()
 
 bot = forwarder = None
+request = Request()
+API_BASE = 'https://api.telegram.org/bot%s/%s'
 SG_ID = int(os.environ['SG_ID']) # supergroup ID
 CH_ID = int(os.environ['CH_ID']) # channel ID
 TOKEN = os.environ['TOKEN']
@@ -51,6 +54,8 @@ STR.unsupported = '不支持的消息'
 STR.banned = '%s 已被暂时禁言'
 STR.whoami = '你当前的标签是 [%s]'
 STR.tag_reset = '匿名标签已重置'
+STR.poll_help = '发起投票:\n<pre>/poll 问题\n选项1\n选项2\n[...]</pre>\n\n' \
+    '如需发起 [Anonymous] 投票，首行改为:\n<pre>///poll 问题</pre>'
 
 class DB:
     def __init__(self):
@@ -183,6 +188,17 @@ def ban(bot, update, args):
     else:
         update.message.reply_text(str())
 
+def send_poll(name, txt):
+    q, *opt = txt.split('\n')
+    q = q.strip()
+    options = [i.strip() for i in opt if 1<=len(i)<=100]
+    if not (1<=len(q)<=255 and 2<=len(options)<=10):
+        return None
+    question = '[%s] %s'%(name, q)
+    url = API_BASE%(TOKEN, 'sendPoll')
+    data = {'chat_id':SG_ID, 'question':question, 'options':options}
+    return request.post(url, data)
+
 def forward_message(bot, msg):
     if G.refresh is None:
         announce(STR.tag_reset)
@@ -190,14 +206,14 @@ def forward_message(bot, msg):
 
     name = generate_hash(msg.from_user.id)
     raw_txt = msg.text or msg.caption or ''
-    txt = msg.text_markdown or msg.caption_markdown or ''
-    mode = "Markdown"
+    txt = msg.text_html or msg.caption_html or ''
+    mode = "HTML"
     if raw_txt.startswith('//'):
         raw_txt = raw_txt[2:].strip()
-        txt = txt.replace('/', '', 2)
+        txt = re.sub(r'(?<!<)\/', '', txt, 2)
         name = 'Anonymous'
 
-    txt = '*[%s] *'%name + txt
+    txt = '<b>[%s] </b>'%name + txt
     chmsg_id = 0
 
     if name in banned_names:
@@ -210,7 +226,11 @@ def forward_message(bot, msg):
     elif msg.document:
         r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode=mode)
     elif raw_txt:
-        if any([i.type in ('url', 'text_link') for i in msg.entities]):
+        if re.match(r'\/poll\b', raw_txt):
+            r = send_poll(name, raw_txt[5:])
+            if r is None:
+                return msg.reply_text(STR.poll_help, parse_mode="HTML")
+        elif any([i.type in ('url', 'text_link') for i in msg.entities]):
             chmsg = bot.send_message(CH_ID, txt, parse_mode=mode)
             chmsg_id = chmsg.message_id
             r = forwarder.forward_message(SG_ID, CH_ID, chmsg_id)
@@ -220,7 +240,7 @@ def forward_message(bot, msg):
         return msg.reply_text(STR.unsupported)
 
     G.refresh = now() + 10000
-    msg_id = (chmsg_id << 24) + r.message_id
+    msg_id = (chmsg_id << 24) + r['message_id']
     text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
     return msg.reply_text(text, reply_to_message_id=msg.message_id)
 
