@@ -4,7 +4,7 @@
 # LICENSE: GNU Affero General Public License, version 3
 # required packages: python-telegram-bot
 
-from telegram.utils.request import Request
+from telegram import InputMediaVideo, InputMediaPhoto
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 import logging, time, random, datetime, os, sys, hmac, hashlib, threading, re
 
@@ -16,8 +16,6 @@ bstr = lambda s: str(s).encode('ascii')
 hmac_md5 = lambda key, msg: hmac.new(key, bstr(msg), digestmod=hashlib.md5).hexdigest()
 
 bot = forwarder = None
-request = Request()
-API_BASE = 'https://api.telegram.org/bot%s/%s'
 SG_ID = int(os.environ['SG_ID']) # supergroup ID
 CH_ID = int(os.environ['CH_ID']) # channel ID
 TOKEN = os.environ['TOKEN']
@@ -54,8 +52,7 @@ STR.unsupported = '不支持的消息'
 STR.banned = '%s 已被暂时禁言'
 STR.whoami = '你当前的标签是 [%s]'
 STR.tag_reset = '匿名标签已重置'
-STR.poll_help = '发起投票:\n<pre>/poll 问题\n选项1\n选项2\n[...]</pre>\n\n' \
-    '如需发起 [Anonymous] 投票，首行改为:\n<pre>///poll 问题</pre>'
+STR.poll_help = '请直接在 bot 私聊中发起投票'
 
 class DB:
     def __init__(self):
@@ -135,36 +132,37 @@ def announce(msg):
     r = bot.send_message(SG_ID, '<b>[Bot] </b>'+msg, parse_mode="HTML")
     return r.message_id
 
-def ping(bot, update):
+def ping(update, context):
     update.message.reply_text('pong')
 
-def start(bot, update):
+def start(update, context):
     user_id = update.message.from_user.id
     text = STR.verified if user_in_group(user_id) else STR.welcome
     update.message.reply_text(text)
 
-def delete(bot, update, args):
+def delete(update, context):
     try:
-        msg_id, key = args
+        msg_id, key = context.args
         if key != hmac_md5(SECRET, msg_id): raise
-        chmsg_id = int(msg_id) >> 24
-        sgmsg_id = int(msg_id) & 0xffffff
-        if chmsg_id:
-            forwarder.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
-            bot.delete_message(chat_id=CH_ID, message_id=chmsg_id)
-        else:
-            bot.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
+        for i in msg_id.split(','):
+            chmsg_id = int(i) >> 24
+            sgmsg_id = int(i) & 0xffffff
+            if chmsg_id:
+                forwarder.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
+                bot.delete_message(chat_id=CH_ID, message_id=chmsg_id)
+            else:
+                bot.delete_message(chat_id=SG_ID, message_id=sgmsg_id)
         update.message.reply_text(STR.deleted)
     except: pass
 
-def whoami(bot, update):
+def whoami(update, context):
     user_id = update.message.from_user.id
     if not user_in_group(user_id):
-        return start(bot, update)
+        return start(update, context)
     name = generate_hash(user_id)
     return update.message.reply_text(STR.whoami%name)
 
-def verify(bot, update):
+def verify(update, context):
     user_id = update.message.from_user.id
     if user_in_group(user_id, use_cache=False):
         return update.message.reply_text(STR.verified)
@@ -174,7 +172,8 @@ def verify(bot, update):
     db.set("answer:%s"%user_id, answer, ex=3600)
     update.message.reply_text(question)
 
-def ban(bot, update, args):
+def ban(update, context):
+    args = context.args
     user_id = update.message.from_user.id
     if get_member_status(user_id) not in admin_status: return
     name = str(args[0]).title()
@@ -188,18 +187,20 @@ def ban(bot, update, args):
     else:
         update.message.reply_text(str())
 
-def send_poll(name, txt):
-    q, *opt = txt.split('\n')
-    q = q.strip()
-    options = [i.strip() for i in opt if 1<=len(i)<=100]
-    if not (1<=len(q)<=255 and 2<=len(options)<=10):
-        return None
-    question = '[%s] %s'%(name, q)
-    url = API_BASE%(TOKEN, 'sendPoll')
-    data = {'chat_id':SG_ID, 'question':question, 'options':options}
-    return request.post(url, data)
+def extract_media(msg, txt=None):
+    caption = txt or msg.caption_html
+    if msg.photo:
+        return InputMediaPhoto(msg.photo[-1].file_id, caption=caption, parse_mode="HTML")
+    elif msg.video:
+        return InputMediaVideo(msg.video.file_id, caption=caption, parse_mode="HTML")
 
-def forward_message(bot, msg):
+def send_media_group(msg, media):
+    r = bot.send_media_group(SG_ID, media)
+    msg_id = ','.join([str(i.message_id) for i in r])
+    text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
+    msg.reply_text(text, reply_to_message_id=msg.message_id)
+
+def forward_message(msg, queue):
     if G.refresh is None:
         announce(STR.tag_reset)
         G.refresh = 0 # suppress duplicate announcements
@@ -207,30 +208,43 @@ def forward_message(bot, msg):
     name = generate_hash(msg.from_user.id)
     raw_txt = msg.text or msg.caption or ''
     txt = msg.text_html or msg.caption_html or ''
+    if msg.poll: txt = raw_txt = msg.poll.question
+    if re.match(r'/poll\b', raw_txt):
+        return msg.reply_text(STR.poll_help)
+
     mode = "HTML"
     if raw_txt.startswith('//'):
         raw_txt = raw_txt[2:].strip()
         txt = re.sub(r'(?<!<)\/', '', txt, 2)
         name = 'Anonymous'
 
+    raw_txt = '[%s] '%name + raw_txt
     txt = '<b>[%s] </b>'%name + txt
     chmsg_id = 0
 
     if name in banned_names:
         return msg.reply_text(STR.banned%name)
 
+    media = []
+    if msg.media_group_id:
+        media.append(extract_media(msg, txt))
+        deque = queue.queue
+        while deque and msg.media_group_id == deque[0].message.media_group_id:
+            next = queue.get_nowait().message
+            media.append(extract_media(next))
+    if len(media) > 1:
+        return send_media_group(msg, media)
+
     if msg.photo:
-        r = bot.send_photo(SG_ID, msg.photo[0].file_id, caption=txt, parse_mode=mode)
+        r = bot.send_photo(SG_ID, msg.photo[-1].file_id, caption=txt, parse_mode=mode)
     elif msg.video:
         r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode=mode)
     elif msg.document:
         r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode=mode)
+    elif msg.poll:
+        r = bot.send_poll(SG_ID, raw_txt, [i.text for i in msg.poll.options])
     elif raw_txt:
-        if re.match(r'\/poll\b', raw_txt):
-            r = send_poll(name, raw_txt[5:])
-            if r is None:
-                return msg.reply_text(STR.poll_help, parse_mode="HTML")
-        elif any([i.type in ('url', 'text_link') for i in msg.entities]):
+        if any([i.type in ('url', 'text_link') for i in msg.entities]):
             chmsg = bot.send_message(CH_ID, txt, parse_mode=mode)
             chmsg_id = chmsg.message_id
             r = forwarder.forward_message(SG_ID, CH_ID, chmsg_id)
@@ -244,19 +258,19 @@ def forward_message(bot, msg):
     text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
     return msg.reply_text(text, reply_to_message_id=msg.message_id)
 
-def del_message(bot, update):
+def del_message(update, context):
     update.message.delete()
 
-def message(bot, update):
+def message(update, context):
     msg = update.message
     user_id = msg.from_user.id
 
     if user_in_group(user_id):
-        return forward_message(bot, msg)
+        return forward_message(msg, context.update_queue)
 
     answer = db.pop("answer:%s"%user_id)
     if answer is None:
-        return start(bot, update)
+        return start(update, context)
 
     if msg.text.strip().lower() == answer.lower():
         db.set("auth:%s"%user_id, 1, ex=100)
@@ -264,8 +278,8 @@ def message(bot, update):
     else:
         msg.reply_text(STR.failed)
 
-def error(bot, update, error):
-    logger.warning('Update "%s" caused error "%s"', update, error)
+def error(update, context):
+    logger.warning('Update "%s" caused error "%s"', update, context.error)
 
 def timer():
     while 1:
@@ -283,18 +297,18 @@ def timer():
         except: pass
         time.sleep(1)
 
-forwarder = Updater(FWD_TOKEN).bot
-updater = Updater(TOKEN)
+forwarder = Updater(FWD_TOKEN, use_context=True).bot
+updater = Updater(TOKEN, use_context=True)
 bot = updater.bot
 dp = updater.dispatcher
 
 dp.add_handler(CommandHandler("ping", ping))
-dp.add_handler(CommandHandler("ban", ban, pass_args=True))
+dp.add_handler(CommandHandler("ban", ban))
 dp.add_handler(CommandHandler("help", start, Filters.private))
 dp.add_handler(CommandHandler("start", start, Filters.private))
 dp.add_handler(CommandHandler("verify", verify, Filters.private))
 dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
-dp.add_handler(CommandHandler("delete", delete, Filters.private, pass_args=True))
+dp.add_handler(CommandHandler("delete", delete, Filters.private))
 dp.add_handler(MessageHandler(Filters.private, message))
 dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, del_message))
 dp.add_handler(MessageHandler(Filters.status_update.left_chat_member, del_message))
