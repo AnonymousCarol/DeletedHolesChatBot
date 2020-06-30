@@ -18,6 +18,7 @@ hmac_md5 = lambda key, msg: hmac.new(key, bstr(msg), digestmod=hashlib.md5).hexd
 bot = forwarder = None
 SG_ID = int(os.environ['SG_ID']) # supergroup ID
 CH_ID = int(os.environ['CH_ID']) # channel ID
+BOT_NAME = os.environ['BOT_NAME']
 TOKEN = os.environ['TOKEN']
 FWD_TOKEN = os.environ['FWD_TOKEN']
 SECRET = bstr(os.environ['SECRET'])
@@ -28,6 +29,8 @@ class G:
 
 names_in_use = {}
 banned_names = {}
+reply_msg_id = {}
+reply_ret_id = {}
 admin_status = ("creator", "administrator")
 allowed_status = ("creator", "administrator", "member", "restricted")
 
@@ -53,6 +56,9 @@ STR.banned = '%s 已被暂时禁言'
 STR.whoami = '你当前的标签是 [%s]'
 STR.tag_reset = '匿名标签已重置'
 STR.poll_help = '请直接在 bot 私聊中发起投票'
+STR.reply_start = '下一条消息将会显示为回复 (如需取消: /end)'
+STR.reply_dead = '该链接已失效'
+STR.reply_end = '已取消回复'
 
 class DB:
     def __init__(self):
@@ -135,10 +141,26 @@ def announce(msg):
 def ping(update, context):
     update.message.reply_text('pong')
 
+def end(update, context):
+    user_id = update.message.from_user.id
+    reply_msg_id[user_id] = None
+    update.message.reply_text(STR.reply_end)
+
 def start(update, context):
     user_id = update.message.from_user.id
-    text = STR.verified if user_in_group(user_id) else STR.welcome
-    update.message.reply_text(text)
+    if not user_in_group(user_id, use_cache=False):
+        return update.message.reply_text(STR.welcome)
+    if len(context.args) == 1:
+        m = re.match('re-([0-9a-f]{8})$', context.args[0])
+        if m:
+            ret_id = m.group(1)
+            msg_id = reply_ret_id.get(ret_id)
+            if msg_id:
+                reply_msg_id[user_id] = msg_id
+                return update.message.reply_text(STR.reply_start)
+            else:
+                return update.message.reply_text(STR.reply_dead)
+    update.message.reply_text(STR.verified)
 
 def delete(update, context):
     try:
@@ -187,15 +209,23 @@ def ban(update, context):
     else:
         update.message.reply_text(str())
 
-def extract_media(msg, txt=None):
-    caption = txt or msg.caption_html
+def extract_media(msg, prefix='', txt=None):
+    caption = txt
+    if msg.caption_html and not txt:
+        caption = prefix + msg.caption_html
     if msg.photo:
         return InputMediaPhoto(msg.photo[-1].file_id, caption=caption, parse_mode="HTML")
     elif msg.video:
         return InputMediaVideo(msg.video.file_id, caption=caption, parse_mode="HTML")
 
-def send_media_group(msg, media):
-    r = bot.send_media_group(SG_ID, media)
+def send_media_group(msg_group, ret_id, prefix, reply_id, txt):
+    media = []
+    if msg_group[0].caption or not any([i.caption for i in msg_group]):
+        media.append(extract_media(msg_group.pop(0), txt=prefix + txt))
+    for msg in msg_group:
+        media.append(extract_media(msg, prefix))
+    r = bot.send_media_group(SG_ID, media, reply_to_message_id=reply_id)
+    reply_ret_id[ret_id] = r[0].message_id
     msg_id = ','.join([str(i.message_id) for i in r])
     text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
     msg.reply_text(text, reply_to_message_id=msg.message_id)
@@ -205,7 +235,11 @@ def forward_message(msg, queue):
         announce(STR.tag_reset)
         G.refresh = 0 # suppress duplicate announcements
 
-    name = generate_hash(msg.from_user.id)
+    user_id = msg.from_user.id
+    name = generate_hash(user_id)
+    ret_id = os.urandom(4).hex()
+    reply_id = reply_msg_id.pop(user_id, None)
+    reply = {'reply_to_message_id': reply_id}
     raw_txt = msg.text or msg.caption or ''
     txt = msg.text_html or msg.caption_html or ''
     if msg.poll: txt = raw_txt = msg.poll.question
@@ -218,43 +252,45 @@ def forward_message(msg, queue):
         txt = re.sub(r'(?<!<)\/', '', txt, 2)
         name = 'Anonymous'
 
-    raw_txt = '[%s] '%name + raw_txt
-    txt = '<b>[%s] </b>'%name + txt
+    prefix = '<b><a href="https://t.me/%s?start=re-%s">[%s]</a> </b>'%(BOT_NAME, ret_id, name)
+    prefix_raw = '[%s] '%name
+    prefix_nolink = '<b>[%s] </b>'%name
+    caption = {'caption': prefix + txt, 'parse_mode': mode}
     chmsg_id = 0
 
     if name in banned_names:
         return msg.reply_text(STR.banned%name)
 
-    media = []
+    msg_group = [msg]
     if msg.media_group_id:
-        media.append(extract_media(msg, txt))
         deque = queue.queue
         while deque and msg.media_group_id == deque[0].message.media_group_id:
-            next = queue.get_nowait().message
-            media.append(extract_media(next))
-    if len(media) > 1:
-        return send_media_group(msg, media)
+            msg_group.append(queue.get_nowait().message)
+    if len(msg_group) > 1:
+        return send_media_group(msg_group, ret_id, prefix, reply_id, txt)
 
     if msg.photo:
-        r = bot.send_photo(SG_ID, msg.photo[-1].file_id, caption=txt, parse_mode=mode)
+        r = bot.send_photo(SG_ID, msg.photo[-1].file_id, **caption, **reply)
     elif msg.video:
-        r = bot.send_video(SG_ID, msg.video.file_id, caption=txt, parse_mode=mode)
+        r = bot.send_video(SG_ID, msg.video.file_id, **caption, **reply)
     elif msg.document:
-        r = bot.send_document(SG_ID, msg.document.file_id, caption=txt, parse_mode=mode)
+        r = bot.send_document(SG_ID, msg.document.file_id, **caption, **reply)
     elif msg.poll:
-        r = bot.send_poll(SG_ID, raw_txt, [i.text for i in msg.poll.options])
+        r = bot.send_poll(SG_ID, prefix_raw + raw_txt, [i.text for i in msg.poll.options], **reply)
     elif raw_txt:
-        if any([i.type in ('url', 'text_link') for i in msg.entities]):
-            chmsg = bot.send_message(CH_ID, txt, parse_mode=mode)
+        if not reply_id and any([i.type in ('url', 'text_link') for i in msg.entities]):
+            # main bot can't see forwarder's messages
+            chmsg = bot.send_message(CH_ID, prefix_nolink + txt, parse_mode=mode)
             chmsg_id = chmsg.message_id
             r = forwarder.forward_message(SG_ID, CH_ID, chmsg_id)
         else:
-            r = bot.send_message(SG_ID, txt, parse_mode=mode)
+            r = bot.send_message(SG_ID, prefix + txt, parse_mode=mode, **reply, disable_web_page_preview=True)
     else:
         return msg.reply_text(STR.unsupported)
 
+    reply_ret_id[ret_id] = r.message_id
     G.refresh = now() + 10000
-    msg_id = (chmsg_id << 24) + r['message_id']
+    msg_id = (chmsg_id << 24) + r.message_id
     text = STR.forwarded%(msg_id, hmac_md5(SECRET, msg_id))
     return msg.reply_text(text, reply_to_message_id=msg.message_id)
 
@@ -290,6 +326,7 @@ def timer():
                 G.salt = os.urandom(16)
                 names_in_use.clear()
                 banned_names.clear()
+                reply_msg_id.clear()
                 G.refresh = None
             if G.revoke and t > G.revoke:
                 generate_link()
@@ -306,6 +343,7 @@ dp.add_handler(CommandHandler("ping", ping))
 dp.add_handler(CommandHandler("ban", ban))
 dp.add_handler(CommandHandler("help", start, Filters.private))
 dp.add_handler(CommandHandler("start", start, Filters.private))
+dp.add_handler(CommandHandler("end", end, Filters.private))
 dp.add_handler(CommandHandler("verify", verify, Filters.private))
 dp.add_handler(CommandHandler("whoami", whoami, Filters.private))
 dp.add_handler(CommandHandler("delete", delete, Filters.private))
