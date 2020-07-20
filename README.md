@@ -1,6 +1,6 @@
 # chatbot
 
-telegram bot for group chat admission and anonymous chatting
+telegram bot for pku verification
 
 ## license
 
